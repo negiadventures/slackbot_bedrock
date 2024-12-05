@@ -1,0 +1,8 @@
+.devspace
+.git
+.vscode
+.yarn/cache
+*.md
+dist
+node_modules
+helm

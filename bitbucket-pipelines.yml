@@ -1,0 +1,165 @@
+image: node:18-alpine3.19
+options:
+  docker: true
+definitions:
+  caches:
+    node:
+      key:
+        files:
+          - package.json
+          - yarn.lock.json
+      path: ./node_modules
+  steps:
+    - step: &install_dependencies
+        name: Install Dependencies
+        artifacts:
+          - set_env.sh
+        caches:
+          - node
+        script:
+          - apk --update --no-cache add aws-cli
+          - yarn install --immutable
+          - echo "export CODEARTIFACT_AUTH_TOKEN=$CODEARTIFACT_AUTH_TOKEN" >> set_env.sh
+    - step: &unit_test
+        name: Unit Test
+        size: 2x
+        script:
+          - source set_env.sh
+          - yarn run test
+        caches:
+          - node
+    - step: &e2e_test
+        name: e2e Test
+        size: 2x
+        script:
+          - source set_env.sh
+          - yarn run test:e2e
+        caches:
+          - docker
+          - node
+    - step: &lint
+        name: Code linting
+        script:
+          - source set_env.sh
+          - yarn run lint
+        caches:
+          - node
+    - step: &build
+        name: Build
+        script:
+          - source set_env.sh
+          - yarn run build
+        caches:
+          - node
+        artifacts:
+          paths:
+            - dist/**
+    - step: &build_dev_arm_image
+        name: Build dev arm image
+        runs-on:
+          - 'self.hosted'
+          - 'linux.arm64'
+        image: amazon/aws-cli
+        size: 2x
+        oidc: true
+        script:
+          - aws sts assume-role-with-web-identity --role-arn $CORE_BB_RW_ECR_ROLE --role-session-name build-session --web-identity-token $BITBUCKET_STEP_OIDC_TOKEN --duration-seconds 1500 >/dev/null 2>&1
+          - aws ecr get-login-password --region us-east-1 | docker login -u AWS --password-stdin 649443889121.dkr.ecr.us-east-1.amazonaws.com
+          - export CODEARTIFACT_AUTH_TOKEN=$(aws codeartifact get-authorization-token --domain registry --domain-owner 197565871292 --query authorizationToken --output text --region us-east-1)
+          - DOCKER_BUILDKIT=1 docker build --build-arg CODEARTIFACT_AUTH_TOKEN=$CODEARTIFACT_AUTH_TOKEN --cache-from 649443889121.dkr.ecr.us-east-1.amazonaws.com/slackbot-api-base:local-dev-latest -t 649443889121.dkr.ecr.us-east-1.amazonaws.com/slackbot-api-base:local-dev-latest -t 649443889121.dkr.ecr.us-east-1.amazonaws.com/slackbot-api-base:$BITBUCKET_COMMIT-local-dev -t 649443889121.dkr.ecr.us-east-1.amazonaws.com/slackbot-api-base:arm --target dev --file Dockerfile .
+          - docker push 649443889121.dkr.ecr.us-east-1.amazonaws.com/slackbot-api-base --all-tags
+    - step: &bump_version
+        name: Bump version
+        image:
+          name: 649443889121.dkr.ecr.us-east-1.amazonaws.com/core-images-versioning:1
+          aws:
+            oidc-role: $CORE_BB_READ_ECR_ROLE
+        oidc: true
+        script:
+          - version-release
+
+pipelines:
+  pull-requests:
+    '**':
+      - step: *install_dependencies
+      - parallel:
+          - step: *lint
+          - step: *build
+      - parallel:
+          - step: *unit_test
+          - step: *e2e_test
+  branches:
+    master:
+      - step: *install_dependencies
+      - parallel:
+          - step: *lint
+          - step: *build
+      - parallel:
+          - step: *unit_test
+          - step: *e2e_test
+      - step:
+          name: Deploy to prod
+          image:
+            name: 649443889121.dkr.ecr.us-east-1.amazonaws.com/core-images-deploy:1
+            aws:
+              oidc-role: $CORE_BB_READ_ECR_ROLE
+          oidc: true
+          script:
+            - push_to_s3 --workspace=prod --app-name=$BITBUCKET_REPO_SLUG
+    dev:
+      - step: *install_dependencies
+      - parallel:
+          - step: *lint
+          - step: *build
+      - parallel:
+          - step: *unit_test
+          - step: *e2e_test
+      - step:
+          name: Deploy to dev
+          image:
+            name: 649443889121.dkr.ecr.us-east-1.amazonaws.com/core-images-deploy:1
+            aws:
+              oidc-role: $CORE_BB_READ_ECR_ROLE
+          oidc: true
+          script:
+            - push_to_s3 --workspace=dev --app-name=$BITBUCKET_REPO_SLUG
+      - step: *build_dev_arm_image
+  custom:
+    staging:
+      - step: *install_dependencies
+      - parallel:
+          - step: *lint
+          - step: *build
+      - parallel:
+          - step: *unit_test
+          - step: *e2e_test
+      - step:
+          name: Deploy to staging
+          image:
+            name: 649443889121.dkr.ecr.us-east-1.amazonaws.com/core-images-deploy:1
+            aws:
+              oidc-role: $CORE_BB_READ_ECR_ROLE
+          oidc: true
+          script:
+            - push_to_s3 --workspace=staging --app-name=$BITBUCKET_REPO_SLUG
+    preprod:
+      - step: *install_dependencies
+      - parallel:
+          - step: *lint
+          - step: *build
+      - parallel:
+          - step: *unit_test
+          - step: *e2e_test
+      - step:
+          name: Deploy to preprod
+          image:
+            name: 649443889121.dkr.ecr.us-east-1.amazonaws.com/core-images-deploy:1
+            aws:
+              oidc-role: $CORE_BB_READ_ECR_ROLE
+          oidc: true
+          script:
+            - push_to_s3 --workspace=preprod --app-name=$BITBUCKET_REPO_SLUG
+    build_dev_arm_image:
+      - step: *build_dev_arm_image
+    bump_version:
+      - step: *bump_version
